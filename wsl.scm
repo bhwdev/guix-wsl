@@ -11,7 +11,10 @@
 
 (use-modules (gnu)
              (gnu system images wsl2)
-             ((gnu packages base) #:select (libc-utf8-locales-for-target))
+             ((gnu packages base)
+              #:select (coreutils libc-utf8-locales-for-target))
+             ((gnu packages bash) #:select (bash))
+             ((gnu packages guile) #:select (guile-3.0))
              ((guix utils) #:select (%current-system))
              ((guix build syscalls) #:prefix syscalls:)
              (srfi srfi-1))
@@ -20,24 +23,124 @@
 (define %uid 1000)
 (define %host "gnu")
 
-;; Upstream's wsl.conf sets [user] default=%user.  That skips root's
-;; login shell -- the boot program -- so after any `wsl --terminate' or
-;; host reboot nothing boots /run/current-system or shepherd.  Keep root
-;; as the WSL default user; the boot program drops to %user via sudo.
-;; drvfs mounts default to the WSL default user's IDs, so give /mnt/c
-;; to %user explicitly or it can neither write there nor run .exe files.
+;; Upstream boots from root's login shell, so its wsl.conf's [user]
+;; default=%user skips the boot after any `wsl --terminate' or host
+;; reboot.  Boot from WSL's [boot] command instead: WSL runs it as root
+;; at every distro start, outside any wsl.exe session, so shepherd ends
+;; up under WSL's init and outlives the session that started the distro.
+;; Upstream's login steps that need root happen here too.  Shepherd's
+;; socket is visible to root alone, so once it exists, create
+;; %wsl-booted for login shells to wait on.
+(define %wsl-booted "/run/wsl-booted")
+
+(define (wsl-boot-command user)
+  (program-file
+   "wsl-boot-command"
+   (with-imported-modules '((guix build syscalls))
+     #~(begin
+         (use-modules (guix build syscalls))
+         (define socket "/var/run/shepherd/socket")
+         (setsid)
+         (let ((null (open-fdes "/dev/null" O_RDONLY))
+               (log (open-fdes "/var/log/wsl-boot.log"
+                               (logior O_WRONLY O_CREAT O_APPEND)
+                               #o640)))
+           (dup2 null 0)
+           (dup2 log 1)
+           (dup2 log 2))
+         (unless (file-exists? "/run/current-system")
+           (when (file-exists? socket)
+             (delete-file socket))
+           ;; WSL mounts /run nosuid, which breaks /run/privileged/bin.
+           (mount #f "/run" #f MS_REMOUNT #:update-mtab? #f)
+           ;; The child boots the system and becomes shepherd.
+           (when (zero? (primitive-fork))
+             (let* ((generation (readlink "/var/guix/profiles/system"))
+                    (system (readlink
+                             (if (absolute-file-name? generation)
+                                 generation
+                                 (string-append "/var/guix/profiles/"
+                                                generation)))))
+               (setenv "GUIX_NEW_SYSTEM" system)
+               (execl #$(file-append guile-3.0 "/bin/guile")
+                      "guile" "--no-auto-compile"
+                      (string-append system "/boot"))))
+           (let wait ()
+             (unless (file-exists? socket)
+               (usleep 100000)
+               (wait)))
+           ;; Only now: on the first start, activation creates USER.
+           (let* ((pw (getpw #$user))
+                  (runtime-dir (string-append "/run/user/"
+                                              (number->string
+                                               (passwd:uid pw)))))
+             (unless (file-exists? runtime-dir)
+               (mkdir runtime-dir #o700)
+               (chown runtime-dir (passwd:uid pw) (passwd:gid pw))))
+           (close-port (open-output-file #$%wsl-booted)))))))
+
+;; WSL starts the first session's login shell without waiting for the
+;; [boot] command, and /etc/profile needs the booted system: wait for
+;; it, for at most a minute.  Root can also go by shepherd's socket,
+;; which serves sessions started between a reconfigure and the next
+;; distro start (WSL's default user is still root then).
+;;
+;; The first start after `wsl --import' has no /etc yet, so no wsl.conf
+;; and no [boot] command.  WSL then starts /bin/sh as root, which the
+;; image makes root's login shell: this script.  It starts the boot
+;; command itself, then waits like any other start.  Without
+;; /etc/passwd, WSL also set HOME (and the directory, by default) to /.
+;;
+;; /etc/profile resets PATH, so keep WSL's, with the Windows PATH, as
+;; $WSLPATH.  WSL's XDG_RUNTIME_DIR is WSLg's, shared by every distro
+;; and outliving this one; use /run/user/UID.  Bash, not Guile: before
+;; boot, Guile finds no locales and warns.
+(define (wsl-login-shell shell boot-command)
+  (computed-file
+   "wsl-login-shell"
+   #~(begin
+       (call-with-output-file #$output
+         (lambda (port)
+           (display (string-append "#!" #$shell "
+first=
+if [ ! -e /etc/wsl.conf ] && [ ! -e /run/current-system ]; then
+    first=1
+    " #$boot-command " </dev/null >>/var/log/wsl-boot.log 2>&1 &
+fi
+i=0
+until [ -e " #$%wsl-booted " ] ||
+      { [ -e /run/current-system ] && [ -S /var/run/shepherd/socket ]; }; do
+    if [ $i -eq 600 ]; then
+        echo 'wsl-login-shell: not booted after 60 s, see /var/log/wsl-boot.log' >&2
+        break
+    fi
+    " #$(file-append coreutils "/bin/sleep") " 0.1
+    i=$((i + 1))
+done
+if [ -n \"$first\" ]; then
+    export HOME=/root
+    [ \"$PWD\" = / ] && cd /root
+fi
+export WSLPATH=$PATH SHELL=" #$shell "
+[ -d /run/user/$UID ] && export XDG_RUNTIME_DIR=/run/user/$UID
+exec " #$shell " -l \"$@\"
+")
+                    port)))
+       (chmod #$output #o555))))
+
+;; drvfs mounts take the WSL default user's IDs, so /mnt/c is %user's.
 (define %wsl-conf
-  (plain-file "wsl.conf" (string-append "\
+  (mixed-text-file "wsl.conf" "\
 [user]
-default=root
+default=" %user "
 
 [boot]
 systemd=false
+command=" (wsl-boot-command %user) "
 
 [automount]
 enabled=true
 root=/mnt
-options=uid=" (number->string %uid) "
 
 [network]
 hostname=" %host "
@@ -47,42 +150,13 @@ generateResolvConf=true
 [interop]
 enabled=true
 appendWindowsPath=true
-")))
-
-;; Upstream's boot program forks shepherd inside the wsl.exe session
-;; that triggered boot, so shepherd stops when that session ends.  Run
-;; the upstream program once in a fresh session with stdio on a log
-;; file, wait for it to bring shepherd up, then exec it again for the
-;; actual login (it skips booting once /run/current-system exists).
-;; WSL resolves `--cd ~' (Windows Terminal's default) against root, the
-;; WSL default user, so map /root to USER's home.
-(define (detached-wsl-boot-program user)
-  (let ((boot (wsl-boot-program user)))
-    (program-file
-     "wsl-boot-program-detached"
-     #~(begin
-         (unless (file-exists? "/run/current-system")
-           (let ((pid (primitive-fork)))
-             (when (zero? pid)
-               (setsid)
-               (let ((null (open-fdes "/dev/null" O_RDONLY))
-                     (log (open-fdes "/var/log/wsl-boot.log"
-                                     (logior O_WRONLY O_CREAT O_APPEND)
-                                     #o640)))
-                 (dup2 null 0)
-                 (dup2 log 1)
-                 (dup2 log 2))
-               (execl #$boot "wsl-boot-program" "-c" "true"))
-             (waitpid pid)))
-         (when (string=? (getcwd) "/root")
-           (chdir (passwd:dir (getpw #$user))))
-         (apply execl #$boot "wsl-boot-program" (cdr (command-line)))))))
+"))
 
 ;; WSL mounts / itself.  `guix system reconfigure' still wants a root
 ;; file system holding the store, and checks that its device exists:
 ;; name whatever WSL mounted on / right now (/dev/sdX; the letter
-;; depends on attach order).  Nothing mounts it.  `guix system image'
-;; replaces it with a root of its own.
+;; depends on attach order).  Nothing mounts it, and WSL's `mount -a'
+;; skips /.  `guix system image' replaces it with a root of its own.
 (define %root-device
   (or (any (lambda (mount)
              (and (string=? (syscalls:mount-point mount) "/")
@@ -92,9 +166,9 @@ appendWindowsPath=true
 
 ;; Guix's essential cleanup service empties /tmp, /var/run and /run at
 ;; boot.  WSL mounts a fresh /run at every start, already holding the
-;; booting session's interop socket (/run/WSL/PID_interop): deleting it
-;; leaves the first terminal after a restart unable to run .exe files.
-;; Same cleanup, minus /run.
+;; session interop sockets (/run/WSL/*_interop): deleting them leaves
+;; the first terminal after a restart unable to run .exe files.  Same
+;; cleanup, minus /run.
 (define (wsl-cleanup-gexp _)
   (with-imported-modules '((guix build utils))
     #~(begin
@@ -125,21 +199,11 @@ appendWindowsPath=true
      (list (service-extension boot-service-type wsl-cleanup-gexp)))
     (description "Like cleanup-service-type, but leave WSL's /run alone.")))
 
-;; The boot program logs in through sudo, which keeps DISPLAY but drops
-;; the rest of what WSL sets up for the session: WSLg audio, interop.
-(define %sudoers
-  (plain-file "sudoers" "\
-Defaults env_keep += \"PULSE_SERVER WAYLAND_DISPLAY WSL_DISTRO_NAME WSL_INTEROP WSLENV\"
-root ALL=(ALL) ALL
-%wheel ALL=(ALL) ALL
-"))
-
 (define %base-os
   (make-wsl-os #:user %user #:uid %uid #:hostname %host))
 
 (operating-system
   (inherit %base-os)
-  (sudoers-file %sudoers)
   (essential-services
    (map (lambda (s)
           (if (eq? (service-kind s) cleanup-service-type)
@@ -153,10 +217,12 @@ root ALL=(ALL) ALL
                         (type "ext4")
                         (check? #f))))
   (users (map (lambda (account)
-                (if (string=? (user-account-name account) "root")
+                (if (member (user-account-name account) (list "root" %user))
                     (user-account
                       (inherit account)
-                      (shell (detached-wsl-boot-program %user)))
+                      (shell (wsl-login-shell
+                              (file-append bash "/bin/bash")
+                              (wsl-boot-command %user))))
                     account))
               (operating-system-users %base-os)))
   (services

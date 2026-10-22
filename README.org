@@ -16,24 +16,35 @@ wsl --import Guix $HOME\Guix .\guix-wsl.tar.gz
 wsl -d Guix
 #+end_src
 
-The first start boots the system and logs you in as =guest=, whose
-password is empty.  sudo needs a password, so set one first, then
-update and reconfigure:
+The first start boots the system and opens a root shell.  Give =guest=
+a password (sudo asks for it), then update and reconfigure:
 #+begin_src shell
-passwd                  # at "Current password", just press Enter
+passwd guest
 guix pull               # the image's own guix predates make-wsl-os
-sudo guix system reconfigure /etc/config.scm
+. ~/.config/guix/current/etc/profile    # use the pulled guix
+guix system reconfigure /etc/config.scm
 #+end_src
 
-To use your own account, change =%user= in =/etc/config.scm= and
-reconfigure.  The WSL default user stays =root= on purpose.  Root's login
-shell is the boot program, which starts the system and then switches to
-=%user= with sudo.  For a root shell that skips it:
+Then restart the distro.  WSL reads =/etc/wsl.conf= only when the
+distro starts, and the first start had none:
+#+begin_src powershell
+wsl --terminate Guix
+wsl -d Guix
+#+end_src
+
+From now on WSL boots the system at every start and logs you in as
+=guest=.  To use your own account, change =%user= in =/etc/config.scm=,
+reconfigure, and restart.  For a root shell:
+#+begin_src powershell
+wsl -d Guix -u root
+#+end_src
+
+Boot output goes to =/var/log/wsl-boot.log=.  If the boot hangs, login
+shells give up waiting after a minute.  A root shell that skips the
+wait altogether:
 #+begin_src powershell
 wsl -d Guix -u root --exec /var/guix/profiles/system/profile/bin/bash
 #+end_src
-
-Boot output goes to =/var/log/wsl-boot.log=.
 
 * Build it yourself
 
@@ -52,35 +63,39 @@ cat $(guix system image --image-type=wsl2 image.scm) | ssh windows-machine wsl -
 Each of these was reproduced on Guix master in October 2026.  The fix is
 commented where it lives in =wsl.scm=.
 
-- Lost boot after a restart.  Upstream writes =/etc/wsl.conf= with
-  =[user] default=<user>=, so WSL starts the user's shell directly and
-  root's boot program never runs.  After =wsl --terminate= or a reboot
-  there is no =/run/current-system=, no shepherd, and nothing on PATH.
-  /Fix:/ =default=root=.
-- Shepherd dies with the first terminal.  The boot program starts
-  shepherd inside the =wsl.exe= session that triggered the boot, and
-  shepherd stops when that session ends.  /Fix:/ boot in a fresh
-  session (=setsid=), with stdio on =/var/log/wsl-boot.log=.
+- Lost boot after a restart.  Upstream boots the system from root's
+  login shell, but writes =/etc/wsl.conf= with =[user] default=<user>=,
+  so WSL starts the user's shell directly and the boot never runs.
+  After =wsl --terminate= or a reboot there is no =/run/current-system=,
+  no shepherd, and nothing on PATH.  /Fix:/ boot from wsl.conf's =[boot]
+  command=, which WSL runs as root at every start.  Login shells wait
+  for the boot to finish.  The first start after =wsl --import= has no
+  wsl.conf yet, so there root's login shell boots the system itself.
+- Shepherd dies with the first terminal.  Upstream starts shepherd
+  inside the =wsl.exe= session that triggered the boot, and shepherd
+  stops when that session ends.  /Fix:/ the boot command runs outside
+  any session; it also calls =setsid= and logs to
+  =/var/log/wsl-boot.log=.
 - =guix system reconfigure= fails with "missing root file system":
   =make-wsl-os= declares no file systems.  A placeholder doesn't help.
   A fake device fails the device check, and =mount? #f= makes
   =store-file-system= raise.  /Fix:/ declare the device WSL actually
   mounted on =/=, read when the config is evaluated.
 - No Windows interop in the first terminal after a restart.  Guix's
-  boot-time cleanup deletes all of =/run=, including the booting
-  session's =/run/WSL/<pid>_interop= socket.  /Fix:/ the same cleanup,
-  minus =/run=, which WSL mounts fresh at every start anyway.
-- =/mnt/c= unwritable, and =.exe= files not executable for the user.
-  drvfs takes the WSL default user's uid, which is root here.  /Fix:/
-  =[automount] options=uid=1000=.
-- Shells start in =/root=, because WSL resolves =--cd ~= (Windows
-  Terminal's default) for root.  /Fix:/ map =/root= to the user's home.
-- No WSLg audio.  The final sudo keeps =DISPLAY= but drops
-  =PULSE_SERVER=, =WSL_INTEROP= and friends.  /Fix:/ =env_keep= in
-  sudoers.
+  boot-time cleanup deletes all of =/run=, including WSL's interop
+  sockets in =/run/WSL=.  /Fix:/ the same cleanup, minus =/run=, which
+  WSL mounts fresh at every start anyway.
+
+The default user also fixes what =default=root= (the obvious fix for
+the first problem) breaks: =/mnt/c= belongs to the user, =wsl --cd ~=
+(Windows Terminal's default) is the user's home, and nothing goes
+through sudo, so =PULSE_SERVER= (WSLg audio) and =WSL_INTEROP= reach
+the shell.
 
 Not fixed: =guix system roll-back= and =switch-generation= fail with
 "dummy-bootloader: no such bootloader".  The WSL bootloader isn't one
 =lookup-bootloader-by-name= can find.  To roll back, run
 =sudo ln -sfn system-N-link /var/guix/profiles/system=, then
-=wsl --terminate Guix=.
+=wsl --terminate Guix=.  If the two generations' =wsl.conf= differ,
+restart twice: the first start still reads the newer =wsl.conf=, and
+only the boot that follows activates the older one.
