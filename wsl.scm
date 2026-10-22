@@ -90,6 +90,8 @@
 ;; image makes root's login shell: this script.  It starts the boot
 ;; command itself, then waits like any other start.  Without
 ;; /etc/passwd, WSL also set HOME (and the directory, by default) to /.
+;; /root appears only when shepherd's user-homes service has run, which
+;; can be after the socket: wait for it too, up to ten seconds.
 ;;
 ;; /etc/profile resets PATH, so keep WSL's, with the Windows PATH, as
 ;; $WSLPATH.  WSL's XDG_RUNTIME_DIR is WSLg's, shared by every distro
@@ -119,6 +121,11 @@ until [ -e " #$%wsl-booted " ] ||
 done
 if [ -n \"$first\" ]; then
     export HOME=/root
+    i=0
+    while [ ! -d /root ] && [ $i -lt 100 ]; do
+        " #$(file-append coreutils "/bin/sleep") " 0.1
+        i=$((i + 1))
+    done
     [ \"$PWD\" = / ] && cd /root
 fi
 export WSLPATH=$PATH SHELL=" #$shell "

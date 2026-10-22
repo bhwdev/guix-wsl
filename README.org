@@ -16,8 +16,10 @@ wsl --import Guix $HOME\Guix .\guix-wsl.tar.gz
 wsl -d Guix
 #+end_src
 
-The first start boots the system and opens a root shell.  Give =guest=
-a password (sudo asks for it), then update and reconfigure:
+The first start boots the system and opens a root shell.  Start it
+plainly as above: until it has booted once there is no =/etc/passwd=,
+so =wsl -u root= fails with "User not found".  Give =guest= a password
+(sudo asks for it), then update and reconfigure:
 #+begin_src shell
 passwd guest
 guix pull               # the image's own guix predates make-wsl-os
